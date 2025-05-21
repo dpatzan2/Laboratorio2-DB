@@ -421,4 +421,134 @@ BEGIN
 END;
 $$;
 
+-- ==========================================
+-- VISTAS REQUERIDAS
+-- ==========================================
+
+-- ==========================================
+-- 1. Vista simple: listado de museos con su horario
+-- ==========================================
+CREATE OR REPLACE VIEW v_museos_simple AS
+SELECT 
+    id_museo,
+    nombre,
+    horario_apertura,
+    horario_cierre
+FROM museo;
+
+-- ==========================================
+-- 2. Vista con JOIN y GROUP BY: total de reservas confirmadas por museo
+-- ==========================================
+CREATE OR REPLACE VIEW v_reservas_por_museo AS
+SELECT
+    m.id_museo,
+    m.nombre AS museo,
+    COUNT(r.id_reserva) AS total_reservas
+FROM reserva r
+JOIN visita_guiada v ON r.id_visita = v.id_visita
+JOIN museo m ON v.id_museo = m.id_museo
+WHERE r.estado = 'confirmada'
+GROUP BY m.id_museo, m.nombre;
+
+-- ==========================================
+-- 3. Vista con expresiones (CASE, COALESCE): estado legible de la visita
+-- ==========================================
+
+CREATE OR REPLACE VIEW v_visitas_estado_legible AS
+SELECT
+    id_visita,
+    estado,
+    CASE
+      WHEN estado = 'programada' THEN 'Pendiente de inicio'
+      WHEN estado = 'en_curso'   THEN 'Actualmente en curso'
+      WHEN estado = 'finalizada' THEN 'Concluida'
+      WHEN estado = 'cancelada'  THEN 'Cancelada'
+      ELSE 'Desconocido'
+    END AS descripcion_estado,
+    COALESCE(idioma, 'sin especificar') AS idioma_visita
+FROM visita_guiada;
+
+-- 4. Vista compuesta con JOIN, GROUP BY y COALESCE: plazas disponibles por visita
+CREATE OR REPLACE VIEW v_plazas_disponibles AS
+SELECT
+    v.id_visita,
+    m.nombre        AS museo,
+    tv.nombre       AS tipo_visita,
+    v.fecha_hora_inicio::DATE AS fecha,
+    v.fecha_hora_inicio::TIME AS hora_inicio,
+    v.capacidad_maxima,
+    COALESCE(v.capacidad_maxima - SUM(r.cantidad_personas), v.capacidad_maxima) AS plazas_libres
+FROM visita_guiada v
+JOIN museo m         ON v.id_museo = m.id_museo
+JOIN tipo_visita tv  ON v.id_tipo_visita = tv.id_tipo_visita
+LEFT JOIN reserva r  ON v.id_visita = r.id_visita AND r.estado = 'confirmada'
+GROUP BY 
+    v.id_visita, m.nombre, tv.nombre,
+    v.fecha_hora_inicio, v.capacidad_maxima;
+
+
+-- ==========================================
+-- TRIGGERS REQUERIDOS
+-- ==========================================
+
+
+-- ==========================================
+-- Trigger BEFORE: valida capacidad antes de insertar o actualizar una reserva
+-- ==========================================
+CREATE OR REPLACE FUNCTION fn_check_capacity() RETURNS trigger AS $$
+DECLARE
+    ocupacion_actual INTEGER;
+    cap_max           INTEGER;
+BEGIN
+    -- Suma de todas las personas confirmadas en la visita
+    SELECT COALESCE(SUM(cantidad_personas), 0)
+      INTO ocupacion_actual
+      FROM reserva
+     WHERE id_visita = NEW.id_visita
+       AND estado = 'confirmada';
+
+    -- Capacidad máxima de la visita
+    SELECT capacidad_maxima
+      INTO cap_max
+      FROM visita_guiada
+     WHERE id_visita = NEW.id_visita;
+
+    IF ocupacion_actual + NEW.cantidad_personas > cap_max THEN
+        RAISE EXCEPTION 'Capacidad excedida: disponibles % y se intentan reservar %',
+            cap_max - ocupacion_actual, NEW.cantidad_personas;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_before_reserva
+BEFORE INSERT OR UPDATE ON reserva
+FOR EACH ROW
+EXECUTE FUNCTION fn_check_capacity();
+
+-- ==========================================
+-- Trigger AFTER: registra en la auditoría cada nueva reserva
+-- ==========================================
+CREATE OR REPLACE FUNCTION fn_audit_reserva_insert() RETURNS trigger AS $$
+BEGIN
+    INSERT INTO auditoria_reservas (
+        id_reserva,
+        estado_anterior,
+        estado_nuevo,
+        usuario_cambio
+    ) VALUES (
+        NEW.id_reserva,
+        NULL,
+        NEW.estado,
+        'trigger_after_insert'
+    );
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_after_reserva
+AFTER INSERT ON reserva
+FOR EACH ROW
+EXECUTE FUNCTION fn_audit_reserva_insert();
 
